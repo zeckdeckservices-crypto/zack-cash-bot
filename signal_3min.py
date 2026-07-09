@@ -1,42 +1,19 @@
 #!/usr/bin/env python3
 """
-ZACK CASH v3.0 — Estratégia Baseada em Dados Reais
+ZACK CASH v4.2 — ENTRADA CERTA (CORRIGIDO)
 ═══════════════════════════════════════════════════════
 
-BASEADO EM:
-- Backtest de 5.000 estratégias no Kalshi 15-min (Reddit/TurbineFi)
-- Kelly Criterion para sizing ótimo (pesquisa acadêmica)
-- Análise de mercados de probabilidade (QuantPedia, Substack)
+CORREÇÃO PRINCIPAL:
+- Analisa com 8-10 min restantes (quando contrato ainda é BARATO)
+- Antes analisava com 5 min restantes (contrato já caro = mult < 1.05x)
+- Agora encontra oportunidades reais com mult >= 1.15x
 
-═══════════════════════════════════════════════════════
-ESTRATÉGIAS COMPROVADAS QUE FUNCIONAM:
-═══════════════════════════════════════════════════════
+ESTRATÉGIA ÚNICA: ENTRADA CERTA
+- Preço longe do target (distância >= 0.08%)
+- Contrato barato (multiplicador >= 1.15x)
+- Tendência confirmada (preço se afastando)
+- Movimento estável (sem oscilação)
 
-1. PANIC FADE (93/96 variações lucrativas no backtest!)
-   → Quando o preço do contrato se move RÁPIDO demais, o mercado EXAGERA
-   → Apostar no lado oposto ao pânico = volatility reversion
-   → Funciona porque: em 15 min, movimentos extremos tendem a reverter
-
-2. HIGH PROBABILITY HARVESTING (sua estratégia original melhorada)
-   → Quando probabilidade > 80% e preço está LONGE do target
-   → Entrada segura com ganho consistente (1.10-1.20x)
-   → Funciona porque: com pouco tempo restante, é quase impossível reverter
-
-3. KELLY CRITERION SIZING
-   → Não apostar tudo — calcular o tamanho ideal da aposta
-   → Usar Half-Kelly (metade do recomendado) para proteção
-   → Funciona porque: maximiza crescimento a longo prazo sem quebrar
-
-═══════════════════════════════════════════════════════
-O QUE NÃO FUNCIONA (comprovado por dados):
-═══════════════════════════════════════════════════════
-- Mean reversion (comprar barato e esperar subir): 0/432 lucrativas
-- Targets apertados de 2 centavos: taxas comem o lucro
-- Seguir momentum cegamente: não persiste em 15 min
-- Entrar perto da linha: muito volátil, imprevisível
-
-═══════════════════════════════════════════════════════
-TIMING: Sinal enviado com 4:00 restantes (tempo pro Ezequiel agir)
 ═══════════════════════════════════════════════════════
 """
 
@@ -62,21 +39,20 @@ CRYPTOS = {
     "HYPE": {"series": "KXHYPE15M", "kucoin": "HYPE-USDT"},
 }
 
-# Timing: sinal com 8 minutos restantes (pegar contrato ainda barato)
-MAX_TIME_SIGNAL = 480  # 8:00
+# ═══ TIMING ═══
+# Analisar quando faltam entre 10 e 5 minutos
+# Nesse range, o contrato ainda é barato E já dá pra ver tendência
+MAX_TIME_SIGNAL = 720   # 12 minutos — aceita análise até 12 min restantes
+MIN_TIME_SIGNAL = 180   # 3 minutos — mínimo para o Ezequiel agir
 
-# Kelly: usar Half-Kelly (mais seguro)
-KELLY_FRACTION = 0.5  # metade do Kelly ótimo
-
-# Filtros mínimos
-MIN_DISTANCE_PCT = 0.10  # mínimo 0.10% de distância do target
-MAX_COST = 0.85          # MÁXIMO que vale pagar pelo contrato (acima disso = lucro ridículo)
+# ═══ FILTROS ═══
+MIN_DISTANCE_PCT = 0.08  # mínimo 0.08% de distância do target
+MAX_COST = 0.85          # máximo que vale pagar (acima = lucro ridículo)
 MIN_MULTIPLIER = 1.15    # multiplicador mínimo (1.15x = $100 → +$15)
-MIN_PROBABILITY = 0.60   # mínimo 60% de probabilidade
-PANIC_THRESHOLD = 0.04   # 4% de movimento = pânico (baseado no backtest)
+MIN_PROBABILITY = 0.55   # mínimo 55% de probabilidade implícita
 
-# Log
-LOG_FILE = "trade_log.json"
+# Kelly
+KELLY_FRACTION = 0.5
 
 
 # ═══════════════════════════════════════════════════════════
@@ -87,8 +63,14 @@ def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         r = requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
-        return r.json().get("ok", False)
-    except:
+        result = r.json()
+        if result.get("ok"):
+            return True
+        else:
+            print(f"[TELEGRAM] Erro: {result}")
+            return False
+    except Exception as e:
+        print(f"[TELEGRAM] Exception: {e}")
         return False
 
 
@@ -160,199 +142,26 @@ def get_time_remaining(ct):
 
 
 # ═══════════════════════════════════════════════════════════
-# ESTRATÉGIA 1: PANIC FADE (a que mais funciona!)
-# ═══════════════════════════════════════════════════════════
-
-def detect_panic(df, target, current_price):
-    """
-    Detecta se houve um movimento de pânico nos últimos minutos.
-    Pânico = preço se moveu > PANIC_THRESHOLD% em poucos minutos
-    
-    Se houve pânico, a estratégia é FADE (apostar contra o pânico).
-    
-    Retorna: (is_panic, panic_direction, panic_magnitude, fade_direction)
-    - is_panic: True se detectou pânico
-    - panic_direction: "UP" ou "DOWN" (direção do pânico)
-    - panic_magnitude: % do movimento
-    - fade_direction: direção para apostar (oposta ao pânico)
-    """
-    if df is None or len(df) < 3:
-        return False, None, 0, None
-    
-    closes = df["close"].values
-    
-    # Verificar movimento nos últimos 3-5 minutos
-    n = min(5, len(closes))
-    recent = closes[-n:]
-    
-    # Variação percentual
-    pct_change = (recent[-1] - recent[0]) / recent[0] * 100
-    
-    # Verificar se é pânico (movimento > threshold)
-    if abs(pct_change) >= PANIC_THRESHOLD:
-        if pct_change > 0:
-            # Pânico de ALTA — preço subiu rápido demais
-            # FADE = apostar que vai DESCER (ou pelo menos não subir mais)
-            panic_dir = "UP"
-            fade_dir = "DOWN"
-        else:
-            # Pânico de BAIXA — preço caiu rápido demais
-            # FADE = apostar que vai SUBIR (ou pelo menos não cair mais)
-            panic_dir = "DOWN"
-            fade_dir = "UP"
-        
-        return True, panic_dir, abs(pct_change), fade_dir
-    
-    return False, None, abs(pct_change), None
-
-
-# ═══════════════════════════════════════════════════════════
-# ESTRATÉGIA 2: HIGH PROBABILITY HARVESTING
-# ═══════════════════════════════════════════════════════════
-
-def high_prob_harvest(price, target, market, time_remaining):
-    """
-    Estratégia de colheita de alta probabilidade.
-    Quando o preço está LONGE do target com pouco tempo restante,
-    a probabilidade de reverter é mínima.
-    
-    Retorna: (is_opportunity, direction, probability, confidence)
-    """
-    above_target = price > target
-    direction = "UP" if above_target else "DOWN"
-    dist_pct = abs(price - target) / target * 100
-    
-    # Calcular probabilidade implícita do mercado
-    if above_target:
-        cost = market.get("yes_ask", 0)
-    else:
-        cost = market.get("no_ask", 0)
-    
-    # Normalizar (Kalshi pode retornar em diferentes formatos)
-    if cost > 1:
-        cost = cost / 100
-    if cost <= 0 or cost >= 1:
-        cost = 0.5
-    
-    probability = cost  # custo = probabilidade implícita
-    
-    # Critérios de oportunidade:
-    # 1. Distância mínima do target
-    # 2. Probabilidade alta (mercado concorda que é provável)
-    # 3. Pouco tempo restante (difícil reverter)
-    
-    # FILTRO CRÍTICO: Se o contrato está caro demais, NÃO VALE A PENA
-    # Pagar $0.90+ pra ganhar $0.10 = ridículo
-    multiplier = 1.0 / cost if cost > 0 and cost < 1 else 1.0
-    
-    is_opportunity = (
-        dist_pct >= MIN_DISTANCE_PCT and
-        cost <= MAX_COST and              # NÃO pagar mais que $0.85!
-        multiplier >= MIN_MULTIPLIER and   # Mínimo 1.15x de retorno
-        probability >= MIN_PROBABILITY and
-        time_remaining <= MAX_TIME_SIGNAL
-    )
-    
-    # Confiança baseada em múltiplos fatores
-    confidence = 0
-    if dist_pct >= 0.20:
-        confidence += 35
-    elif dist_pct >= 0.15:
-        confidence += 30
-    elif dist_pct >= 0.10:
-        confidence += 20
-    elif dist_pct >= 0.08:
-        confidence += 10
-    
-    if probability >= 0.85:
-        confidence += 35
-    elif probability >= 0.75:
-        confidence += 25
-    elif probability >= 0.65:
-        confidence += 15
-    elif probability >= 0.60:
-        confidence += 10
-    
-    if time_remaining <= 120:
-        confidence += 20
-    elif time_remaining <= 180:
-        confidence += 15
-    elif time_remaining <= 240:
-        confidence += 10
-    
-    return is_opportunity, direction, probability, confidence, cost
-
-
-# ═══════════════════════════════════════════════════════════
-# ESTRATÉGIA 3: KELLY CRITERION (quanto apostar)
-# ═══════════════════════════════════════════════════════════
-
-def kelly_sizing(p_true, market_price, bankroll=100):
-    """
-    Calcula o tamanho ótimo da aposta usando Kelly Criterion.
-    
-    p_true: sua estimativa da probabilidade real
-    market_price: preço do contrato (probabilidade do mercado)
-    bankroll: capital disponível
-    
-    Retorna: (bet_size, expected_roi, edge)
-    """
-    if market_price <= 0 or market_price >= 1:
-        return 0, 0, 0
-    
-    # Net odds (quanto ganha por $1 apostado se acertar)
-    b = (1 - market_price) / market_price
-    
-    # Probabilidade de perder
-    q = 1 - p_true
-    
-    # Kelly fraction
-    f_star = (b * p_true - q) / b
-    
-    # Aplicar Half-Kelly (mais seguro)
-    f_half = f_star * KELLY_FRACTION
-    
-    # Não apostar se edge negativo
-    if f_half <= 0:
-        return 0, 0, 0
-    
-    # Limitar a 25% do bankroll máximo (proteção extra)
-    f_half = min(f_half, 0.25)
-    
-    bet_size = bankroll * f_half
-    
-    # Expected ROI
-    edge = p_true - market_price
-    expected_roi = edge / market_price * 100
-    
-    return bet_size, expected_roi, edge
-
-
-# ═══════════════════════════════════════════════════════════
 # ANÁLISE DE VOLATILIDADE E ESTABILIDADE
 # ═══════════════════════════════════════════════════════════
 
 def analyze_volatility(df, above_target):
     """
-    Analisa a volatilidade e estabilidade do movimento.
-    
-    Retorna: (volatility_level, trend_strength, is_stable)
-    - volatility_level: "LOW", "MEDIUM", "HIGH"
-    - trend_strength: -100 a +100 (positivo = favorável)
-    - is_stable: True se movimento é calmo e previsível
+    Analisa volatilidade e estabilidade do movimento.
+    Retorna: (volatility_level, trend_strength, is_stable, speed)
     """
     if df is None or len(df) < 3:
-        return "UNKNOWN", 0, False
+        return "UNKNOWN", 0, False, 0
     
     closes = df["close"].values
     n = min(8, len(closes))
     recent = closes[-n:]
     
-    # Calcular variações entre candles
+    # Variações entre candles
     diffs = np.diff(recent)
     pct_changes = diffs / recent[:-1] * 100
     
-    # Volatilidade = desvio padrão das variações
+    # Volatilidade
     vol = np.std(pct_changes)
     
     if vol < 0.02:
@@ -362,24 +171,46 @@ def analyze_volatility(df, above_target):
     else:
         vol_level = "HIGH"
     
-    # Trend strength: consistência direcional
+    # Trend strength
     if above_target:
-        # Favorável = subindo ou estável
         favorable = sum(1 for d in diffs if d >= 0)
     else:
-        # Favorável = descendo ou estável
         favorable = sum(1 for d in diffs if d <= 0)
     
-    trend_strength = int((favorable / len(diffs)) * 100) - 50  # -50 a +50, normalizado
+    trend_strength = int((favorable / len(diffs)) * 100) - 50
     trend_strength = trend_strength * 2  # -100 a +100
     
-    # Estável = baixa volatilidade + tendência consistente
-    is_stable = (vol_level in ["LOW", "MEDIUM"]) and (trend_strength >= 20)
+    # Estável = baixa vol + tendência consistente
+    is_stable = (vol_level in ["LOW", "MEDIUM"]) and (trend_strength >= 0)
     
-    # Velocidade do movimento
+    # Velocidade
     speed = (recent[-1] - recent[0]) / recent[0] * 100
     
     return vol_level, trend_strength, is_stable, speed
+
+
+# ═══════════════════════════════════════════════════════════
+# KELLY CRITERION
+# ═══════════════════════════════════════════════════════════
+
+def kelly_sizing(p_true, market_price, bankroll=100):
+    if market_price <= 0 or market_price >= 1:
+        return 0, 0, 0
+    
+    b = (1 - market_price) / market_price
+    q = 1 - p_true
+    f_star = (b * p_true - q) / b
+    f_half = f_star * KELLY_FRACTION
+    
+    if f_half <= 0:
+        return 0, 0, 0
+    
+    f_half = min(f_half, 0.25)
+    bet_size = bankroll * f_half
+    edge = p_true - market_price
+    expected_roi = edge / market_price * 100
+    
+    return bet_size, expected_roi, edge
 
 
 # ═══════════════════════════════════════════════════════════
@@ -387,15 +218,12 @@ def analyze_volatility(df, above_target):
 # ═══════════════════════════════════════════════════════════
 
 def analyze(crypto, cfg):
-    """
-    Análise completa usando todas as 3 estratégias.
-    Retorna a melhor oportunidade encontrada.
-    """
+    """Análise completa. Retorna oportunidade ou status."""
     market = get_market(cfg["series"])
     if not market:
         return None
     
-    # Extrair target
+    # Extrair target do título
     m = re.search(r'\$([0-9,]+\.?\d*)', market["title"])
     if not m:
         return None
@@ -406,134 +234,145 @@ def analyze(crypto, cfg):
     if tr is None:
         return None
     
+    # Se falta MUITO tempo (> MAX_TIME_SIGNAL), skip
     if tr > MAX_TIME_SIGNAL:
         return {"crypto": crypto, "skip": True, "time_remaining": tr}
+    
+    # Se falta POUCO tempo (< MIN_TIME_SIGNAL), skip (não dá tempo de agir)
+    if tr < MIN_TIME_SIGNAL:
+        return {"crypto": crypto, "skip": True, "time_remaining": tr, "reason": "closing"}
     
     # Preço atual
     price = get_price(cfg["kucoin"])
     if not price:
         return None
     
-    # Candles (últimos 12 minutos)
+    # Candles
     df = get_klines(cfg["kucoin"], 12)
     
     # Dados básicos
     above_target = price > target
     dist_pct = abs(price - target) / target * 100
+    direction = "UP" if above_target else "DOWN"
     
-    # ═══ ESTRATÉGIA 1: PANIC FADE ═══
-    is_panic, panic_dir, panic_mag, fade_dir = detect_panic(df, target, price)
+    # Custo do contrato
+    if above_target:
+        cost = market.get("yes_ask", 0)
+    else:
+        cost = market.get("no_ask", 0)
     
-    # ═══ ESTRATÉGIA 2: HIGH PROBABILITY HARVESTING ═══
-    is_harvest, harvest_dir, probability, confidence, cost = high_prob_harvest(
-        price, target, market, tr
-    )
+    # Normalizar (Kalshi retorna em dólares, ex: 0.42 = 42 cents)
+    if cost > 1:
+        cost = cost / 100
+    if cost <= 0 or cost >= 1:
+        # Sem preço válido
+        return {"crypto": crypto, "skip": False, "classification": "NAO_ENTRAR",
+                "direction": direction, "price": price, "target": target,
+                "dist_pct": dist_pct, "cost": cost, "mult": 1.0,
+                "time_remaining": tr, "score": -50,
+                "reasons": [], "warnings": ["Sem preço de contrato disponível"],
+                "probability": 0, "ganho_100": 0, "vol_level": "UNKNOWN",
+                "trend_strength": 0, "is_stable": False, "speed": 0,
+                "edge": 0, "bet_size_pct": 0, "expected_roi": 0, "strategy": None}
     
-    # ═══ ANÁLISE DE VOLATILIDADE ═══
+    # Multiplicador
+    mult = 1.0 / cost
+    mult = min(mult, 20.0)
+    ganho_100 = (mult - 1) * 100
+    
+    # Probabilidade implícita
+    probability = cost
+    
+    # Análise de volatilidade
     vol_level, trend_strength, is_stable, speed = analyze_volatility(df, above_target)
     
-    # ═══ DECISÃO FINAL: Qual estratégia usar? ═══
+    # ═══ DECISÃO: ENTRADA CERTA ═══
     strategy = None
-    direction = None
     score = 0
     reasons = []
     warnings = []
     
-    # PANIC FADE DESATIVADO — causou perda, estratégia não confiável
-    # Foco 100% em entradas CERTAS (alta probabilidade + contrato barato + longe da linha)
-    pass
+    # Filtros básicos
+    dist_ok = dist_pct >= MIN_DISTANCE_PCT
+    mult_ok = mult >= MIN_MULTIPLIER
+    cost_ok = cost <= MAX_COST
+    trend_ok = trend_strength >= -10  # não está fortemente contra
+    stable_ok = is_stable or vol_level in ["LOW", "MEDIUM"]
     
-    # ESTRATÉGIA ÚNICA: ENTRADA CERTA (alta prob + longe + barato + estável)
-    if strategy is None and is_harvest and confidence >= 50:
-        # FILTROS RIGOROSOS - só entra quando for CERTEZA:
-        # 1. Distância mínima 0.15% (longe da linha)
-        # 2. Tendência confirmada (preço se afastando)
-        # 3. Estabilidade (sem oscilação louca)
-        # 4. Contrato barato (mult >= 1.18x)
+    if dist_ok and mult_ok and cost_ok and trend_ok and stable_ok:
+        strategy = "ENTRADA_CERTA"
         
-        dist_ok = dist_pct >= 0.15
-        trend_ok = trend_strength >= 0  # não está indo contra
-        stable_ok = is_stable or vol_level == "LOW"
-        
-        if dist_ok and trend_ok and stable_ok:
-            strategy = "ENTRADA_CERTA"
-            direction = harvest_dir
-            score = confidence
-            
-            reasons.append(f"ENTRADA CERTA: {probability*100:.1f}% de chance")
-            reasons.append(f"Distância segura: {dist_pct:.3f}% do target")
-            reasons.append(f"Tendência confirmada: preço se afastando da linha")
-            
-            if is_stable:
-                score += 20
-                reasons.append(f"Movimento estável e calmo — SEGURO")
-            
-            if tr <= 120:
-                score += 10
-                reasons.append(f"Quase fechando ({int(tr//60)}:{int(tr%60):02d}) — definido")
+        # Calcular score
+        # Distância
+        if dist_pct >= 0.30:
+            score += 40
+        elif dist_pct >= 0.20:
+            score += 35
+        elif dist_pct >= 0.15:
+            score += 30
+        elif dist_pct >= 0.10:
+            score += 25
         else:
-            # Explica por que não entrar
-            if not dist_ok:
-                warnings.append(f"Perto demais da linha ({dist_pct:.3f}%) — PERIGOSO")
-            if not trend_ok:
-                warnings.append(f"Tendência contra — preço se aproximando da linha")
-            if not stable_ok:
-                warnings.append(f"Mercado instável — oscilando demais")
-    
-    # Se nenhuma estratégia se aplica
-    if strategy is None:
-        direction = "UP" if above_target else "DOWN"
-        score = 0
+            score += 15
         
-        # Verificar por que não entrar
-        if dist_pct < MIN_DISTANCE_PCT:
-            warnings.append(f"PERTO DEMAIS da linha ({dist_pct:.3f}%) — NÃO ENTRAR")
-            score -= 50
-        if probability < MIN_PROBABILITY if 'probability' in dir() else True:
-            pass
-        if vol_level == "HIGH":
-            warnings.append(f"Volatilidade ALTA — mercado instável")
-            score -= 20
-        if trend_strength < -20:
-            warnings.append(f"Tendência CONTRA — preço indo na direção errada")
-            score -= 30
-    
-    # ═══ KELLY SIZING ═══
-    if strategy and direction:
-        # Estimar probabilidade real (nossa estimativa vs mercado)
-        if strategy == "PANIC_FADE":
-            # No panic fade, acreditamos que o mercado exagerou
-            # Nossa p_true é MAIOR que o mercado indica
-            p_true = min(0.90, probability + 0.10 if 'probability' in dir() and probability else 0.70)
-            market_price = cost if 'cost' in dir() and cost else 0.50
-        else:
-            p_true = probability
-            market_price = cost
+        # Multiplicador (quanto mais barato, melhor)
+        if mult >= 2.0:
+            score += 30
+        elif mult >= 1.5:
+            score += 25
+        elif mult >= 1.3:
+            score += 20
+        elif mult >= 1.15:
+            score += 15
         
-        bet_size, expected_roi, edge = kelly_sizing(p_true, market_price)
+        # Tendência
+        if trend_strength >= 50:
+            score += 20
+        elif trend_strength >= 20:
+            score += 15
+        elif trend_strength >= 0:
+            score += 10
+        
+        # Estabilidade
+        if vol_level == "LOW":
+            score += 15
+        elif vol_level == "MEDIUM":
+            score += 10
+        
+        # Tempo (quanto menos tempo, mais definido)
+        if tr <= 300:
+            score += 10
+        elif tr <= 480:
+            score += 5
+        
+        reasons.append(f"Distância segura: {dist_pct:.3f}% do target")
+        reasons.append(f"Contrato barato: ${cost:.2f} (mult {mult:.2f}x)")
+        reasons.append(f"Tendência {'favorável' if trend_strength >= 20 else 'neutra'}")
+        if is_stable:
+            reasons.append(f"Movimento estável — SEGURO")
+        
+    else:
+        # Explicar por que não entrar
+        if not dist_ok:
+            warnings.append(f"Perto demais da linha ({dist_pct:.3f}%)")
+        if not mult_ok:
+            warnings.append(f"Contrato caro (${cost:.2f}, mult {mult:.2f}x)")
+        if not cost_ok:
+            warnings.append(f"Custo alto demais (${cost:.2f})")
+        if not trend_ok:
+            warnings.append(f"Tendência contra (força: {trend_strength})")
+        if not stable_ok:
+            warnings.append(f"Mercado instável (vol: {vol_level})")
+    
+    # Kelly sizing
+    if strategy:
+        p_true = min(0.95, probability + 0.05)  # pequeno edge sobre o mercado
+        bet_size, expected_roi, edge = kelly_sizing(p_true, cost)
     else:
         bet_size, expected_roi, edge = 0, 0, 0
-        p_true = 0
-        market_price = 0
     
-    # Multiplicador
-    if cost > 0 and cost < 1:
-        mult = 1.0 / cost
-    else:
-        mult = 1.0
-    mult = min(mult, 20.0)
-    ganho_100 = (mult - 1) * 100
-    
-    # FILTRO FINAL OBRIGATÓRIO: multiplicador mínimo
-    # NUNCA recomendar se multiplicador < 1.15x (lucro ridículo)
-    if mult < MIN_MULTIPLIER and strategy is not None:
-        strategy = None
-        score = -10
-        warnings.append(f"Multiplicador muito baixo ({mult:.2f}x) — lucro insuficiente")
-        reasons.clear()
-    
-    # Classificação final - SÓ ENTRAR quando for CERTEZA
-    if score >= 70 and mult >= MIN_MULTIPLIER and strategy == "ENTRADA_CERTA":
+    # Classificação final
+    if strategy == "ENTRADA_CERTA" and score >= 60:
         classification = "ENTRAR"
     else:
         classification = "NAO_ENTRAR"
@@ -548,11 +387,10 @@ def analyze(crypto, cfg):
         "price": price,
         "target": target,
         "dist_pct": dist_pct,
-        "probability": probability if 'probability' in dir() else 0,
-        "cost": cost if 'cost' in dir() else 0,
+        "probability": probability,
+        "cost": cost,
         "mult": mult,
         "ganho_100": ganho_100,
-        "p_true": p_true,
         "edge": edge,
         "bet_size_pct": bet_size,
         "expected_roi": expected_roi,
@@ -560,8 +398,6 @@ def analyze(crypto, cfg):
         "trend_strength": trend_strength,
         "is_stable": is_stable,
         "speed": speed,
-        "is_panic": is_panic,
-        "panic_mag": panic_mag if is_panic else 0,
         "time_remaining": tr,
         "reasons": reasons,
         "warnings": warnings,
@@ -575,25 +411,24 @@ def analyze(crypto, cfg):
 def format_message(results, skipped):
     now_str = datetime.now().strftime("%H:%M:%S")
     
-    # Filtrar apenas resultados válidos
     valid = [r for r in results if not r.get("skip")]
     
     if not valid:
+        # Nenhum mercado na janela de análise
         if skipped:
-            next_signal = min(s["time_remaining"] for s in skipped) - MAX_TIME_SIGNAL
-            if next_signal < 0: next_signal = 0
-            
-            msg = f"🤖 <b>ZACK CASH v3.0 — {now_str}</b>\n"
+            msg = f"🤖 <b>ZACK CASH v4.2 — {now_str}</b>\n"
             msg += f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            msg += f"⏳ <b>AGUARDANDO...</b>\n\n"
-            msg += f"Próximo sinal em ~{int(next_signal//60)}:{int(next_signal%60):02d}\n\n"
-            msg += f"📋 <b>Mercados:</b>\n"
-            for s in skipped:
+            msg += f"⏳ <b>AGUARDANDO JANELA...</b>\n\n"
+            for s in skipped[:5]:
                 tr = s["time_remaining"]
-                msg += f"  • {s['crypto']} — {int(tr//60)}:{int(tr%60):02d}\n"
+                reason = s.get("reason", "")
+                if reason == "closing":
+                    msg += f"  • {s['crypto']} — fechando ({int(tr//60)}:{int(tr%60):02d})\n"
+                else:
+                    msg += f"  • {s['crypto']} — {int(tr//60)}:{int(tr%60):02d} restantes\n"
         else:
-            msg = f"🤖 <b>ZACK CASH v3.0 — {now_str}</b>\n\n⚠️ Nenhum mercado aberto."
-        return msg
+            msg = f"🤖 <b>ZACK CASH v4.2 — {now_str}</b>\n\n⚠️ Nenhum mercado aberto."
+        return msg, False
     
     # Ordenar por score
     valid.sort(key=lambda x: x["score"], reverse=True)
@@ -602,21 +437,13 @@ def format_message(results, skipped):
     mins = int(best["time_remaining"] // 60)
     secs = int(best["time_remaining"] % 60)
     
-    msg = f"🤖 <b>ZACK CASH v3.0 — {now_str}</b>\n"
+    msg = f"🤖 <b>ZACK CASH v4.2 — {now_str}</b>\n"
     msg += f"━━━━━━━━━━━━━━━━━━━━\n\n"
     
     if best["classification"] == "ENTRAR":
         dir_emoji = "⬆️" if best["direction"] == "UP" else "⬇️"
         
-        # Identificar estratégia
-        if best["strategy"] == "PANIC_FADE":
-            strat_name = "PANIC FADE"
-            strat_emoji = "🔄"
-        else:
-            strat_name = "ALTA PROBABILIDADE"
-            strat_emoji = "🎯"
-        
-        msg += f"🟢 <b>ENTRAR — {strat_name} {strat_emoji}</b>\n\n"
+        msg += f"🟢 <b>ENTRAR — ENTRADA CERTA 🎯</b>\n\n"
         msg += f"🪙 <b>{best['crypto']}</b> → <b>{best['direction']} {dir_emoji}</b>\n"
         msg += f"⏱ Fecha em: <b>{mins}:{secs:02d}</b>\n\n"
         
@@ -624,14 +451,14 @@ def format_message(results, skipped):
         msg += f"  💲 Preço: ${best['price']:,.2f}\n"
         msg += f"  🎯 Target: ${best['target']:,.2f}\n"
         msg += f"  📏 Distância: {best['dist_pct']:.3f}%\n"
-        msg += f"  🎲 Probabilidade: {best['probability']*100:.1f}%\n"
-        msg += f"  💰 Multiplicador: {best['mult']:.2f}x\n"
+        msg += f"  💰 Custo: ${best['cost']:.2f} (mult {best['mult']:.2f}x)\n"
         msg += f"  💵 $100 → +${best['ganho_100']:.0f}\n\n"
         
-        msg += f"📐 <b>Kelly (matemática):</b>\n"
-        msg += f"  • Edge: +{best['edge']*100:.1f}% sobre o mercado\n"
-        msg += f"  • ROI esperado: +{best['expected_roi']:.1f}%\n"
-        msg += f"  • Aposta ideal: {best['bet_size_pct']:.0f}% do capital\n\n"
+        if best["edge"] > 0:
+            msg += f"📐 <b>Kelly:</b>\n"
+            msg += f"  • Edge: +{best['edge']*100:.1f}%\n"
+            msg += f"  • ROI esperado: +{best['expected_roi']:.1f}%\n"
+            msg += f"  • Aposta ideal: {best['bet_size_pct']:.0f}% do capital\n\n"
         
         msg += f"✅ <b>Por que entrar:</b>\n"
         for r in best["reasons"]:
@@ -642,94 +469,23 @@ def format_message(results, skipped):
             for w in best["warnings"]:
                 msg += f"  • {w}\n"
         
-        msg += f"\n💡 <b>Score: {best['score']}</b> | Estabilidade: {best['vol_level']}"
-    
-    elif best["classification"] == "POSSIVEL":
-        dir_emoji = "⬆️" if best["direction"] == "UP" else "⬇️"
-        
-        msg += f"🟡 <b>POSSÍVEL — CUIDADO</b>\n\n"
-        msg += f"🪙 <b>{best['crypto']}</b> → <b>{best['direction']} {dir_emoji}</b>\n"
-        msg += f"⏱ Fecha em: <b>{mins}:{secs:02d}</b>\n\n"
-        msg += f"  📏 Distância: {best['dist_pct']:.3f}%\n"
-        msg += f"  🎲 Probabilidade: {best['probability']*100:.1f}%\n"
-        msg += f"  💰 Mult: {best['mult']:.2f}x | $100→+${best['ganho_100']:.0f}\n\n"
-        
-        if best["reasons"]:
-            msg += f"✅ <b>A favor:</b>\n"
-            for r in best["reasons"]:
-                msg += f"  • {r}\n"
-        if best["warnings"]:
-            msg += f"\n❌ <b>Contra:</b>\n"
-            for w in best["warnings"]:
-                msg += f"  • {w}\n"
-        
-        msg += f"\n⚠️ Considere valor menor. Score: {best['score']}"
+        msg += f"\n💡 <b>Score: {best['score']}</b> | Vol: {best['vol_level']}"
+        return msg, True
     
     else:
         msg += f"🔴 <b>NÃO ENTRAR</b>\n\n"
         msg += f"Nenhuma oportunidade segura agora.\n\n"
         
-        for ev in valid[:3]:
+        for ev in valid[:4]:
             dir_emoji = "⬆️" if ev["direction"] == "UP" else "⬇️"
-            msg += f"  ❌ {ev['crypto']} {dir_emoji} — Score: {ev['score']}\n"
+            tr_m = int(ev["time_remaining"] // 60)
+            tr_s = int(ev["time_remaining"] % 60)
+            msg += f"  ❌ {ev['crypto']} {dir_emoji} | dist:{ev['dist_pct']:.3f}% | ${ev['cost']:.2f} ({ev['mult']:.2f}x) | {tr_m}:{tr_s:02d}\n"
             if ev["warnings"]:
                 msg += f"     ↳ {ev['warnings'][0]}\n"
         
-        msg += f"\n⏳ Aguarde próximo ciclo."
-    
-    # Ranking
-    msg += f"\n\n━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"📋 <b>Ranking:</b>\n"
-    for ev in valid[:5]:
-        if ev["classification"] == "ENTRAR":
-            icon = "🟢"
-        elif ev["classification"] == "POSSIVEL":
-            icon = "🟡"
-        else:
-            icon = "🔴"
-        dir_emoji = "⬆️" if ev["direction"] == "UP" else "⬇️"
-        strat = "PF" if ev.get("strategy") == "PANIC_FADE" else "HP" if ev.get("strategy") == "HIGH_PROB" else "—"
-        msg += f"  {icon} {ev['crypto']} {dir_emoji} | {ev['probability']*100:.0f}% | {ev['dist_pct']:.3f}% | {strat} | S:{ev['score']}\n"
-    
-    return msg
-
-
-# ═══════════════════════════════════════════════════════════
-# LOG PARA APRENDIZADO
-# ═══════════════════════════════════════════════════════════
-
-def log_signal(result):
-    try:
-        logs = []
-        if os.path.exists(LOG_FILE):
-            with open(LOG_FILE, "r") as f:
-                logs = json.load(f)
-        
-        entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "crypto": result["crypto"],
-            "strategy": result.get("strategy"),
-            "direction": result["direction"],
-            "classification": result["classification"],
-            "price": result["price"],
-            "target": result["target"],
-            "dist_pct": result["dist_pct"],
-            "probability": result["probability"],
-            "mult": result["mult"],
-            "score": result["score"],
-            "edge": result["edge"],
-            "time_remaining": result["time_remaining"],
-            "speed": result["speed"],
-            "vol_level": result["vol_level"],
-            "is_panic": result["is_panic"],
-            "result": None,
-        }
-        logs.append(entry)
-        
-        with open(LOG_FILE, "w") as f:
-            json.dump(logs, f, indent=2)
-    except:
-        pass
+        msg += f"\n⏳ Próximo ciclo em ~15 min."
+        return msg, False
 
 
 # ═══════════════════════════════════════════════════════════
@@ -738,8 +494,8 @@ def log_signal(result):
 
 def main():
     print("=" * 60)
-    print("  ZACK CASH v3.0 — Estratégias Comprovadas por Dados")
-    print("  Panic Fade | High Probability | Kelly Criterion")
+    print("  ZACK CASH v4.2 — ENTRADA CERTA (timing corrigido)")
+    print("  Analisa com 10 min restantes | Mult >= 1.15x")
     print("=" * 60)
     print()
     
@@ -749,32 +505,22 @@ def main():
     for crypto, cfg in CRYPTOS.items():
         r = analyze(crypto, cfg)
         if r is None:
+            print(f"  {crypto}: sem dados")
             continue
         if r.get("skip"):
             skipped.append(r)
             tr = r["time_remaining"]
-            print(f"  {crypto}: SKIP — faltam {int(tr//60)}:{int(tr%60):02d}")
+            reason = r.get("reason", "")
+            print(f"  {crypto}: SKIP — {int(tr//60)}:{int(tr%60):02d} {'(fechando)' if reason == 'closing' else ''}")
         else:
             results.append(r)
-            strat = r.get("strategy", "—")
-            print(f"  {crypto}: {r['direction']} | {r['classification']} | {strat} | score={r['score']} | prob={r['probability']*100:.1f}% | dist={r['dist_pct']:.3f}%")
+            print(f"  {crypto}: {r['direction']} | {r['classification']} | score={r['score']} | dist={r['dist_pct']:.3f}% | ${r['cost']:.2f} ({r['mult']:.2f}x)")
     
     # Formatar e enviar
-    msg = format_message(results, skipped)
+    msg, is_entry = format_message(results, skipped)
     ok = send_telegram(msg)
     
-    # Log da melhor oportunidade
-    valid = [r for r in results if not r.get("skip") and r.get("classification") in ["ENTRAR", "POSSIVEL"]]
-    if valid:
-        valid.sort(key=lambda x: x["score"], reverse=True)
-        log_signal(valid[0])
-    
-    # Status
-    if valid:
-        best = valid[0]
-        print(f"\n[{'OK' if ok else 'ERRO'}] {best['classification']} | {best['crypto']} {best['direction']} | {best.get('strategy','—')} | score={best['score']}")
-    else:
-        print(f"\n[{'OK' if ok else 'ERRO'}] Nenhuma oportunidade")
+    print(f"\n[{'OK' if ok else 'ERRO TELEGRAM'}] Mensagem enviada: {'ENTRAR' if is_entry else 'NÃO ENTRAR/AGUARDANDO'}")
 
 
 if __name__ == "__main__":
