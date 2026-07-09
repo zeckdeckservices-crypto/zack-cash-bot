@@ -439,58 +439,46 @@ def analyze(crypto, cfg):
     reasons = []
     warnings = []
     
-    # PRIORIDADE 1: Panic Fade (quando detectado)
-    # FILTRO CRÍTICO: Panic Fade SÓ vale se o contrato estiver BARATO
-    # Se o contrato já está caro ($0.85+), não tem lucro mesmo com panic fade
-    panic_cost = None
-    if is_panic and panic_mag >= PANIC_THRESHOLD:
-        # Determinar o custo do contrato na direção do fade
-        if fade_dir == "UP":
-            panic_cost = market.get("yes_ask", 0)
-        else:
-            panic_cost = market.get("no_ask", 0)
-        if panic_cost and panic_cost > 1:
-            panic_cost = panic_cost / 100
-        
-        # SÓ entrar se contrato estiver BARATO (≤ $0.80 = mult ≥ 1.25x)
-        panic_cost_ok = panic_cost and 0 < panic_cost <= MAX_COST
-        
-        if panic_cost_ok and fade_dir == "UP" and price < target:
-            # Pânico de baixa + preço abaixo do target = fade UP
-            strategy = "PANIC_FADE"
-            direction = "UP"
-            score = 60 + int(panic_mag * 10)
-            reasons.append(f"PANIC FADE: Mercado caiu {panic_mag:.2f}% em minutos — exagero!")
-            reasons.append(f"Contrato BARATO: ${panic_cost:.2f} (mult {1/panic_cost:.2f}x)")
-            reasons.append(f"Backtest: 93/96 variações lucrativas")
-        elif panic_cost_ok and fade_dir == "DOWN" and price > target:
-            # Pânico de alta + preço acima do target = fade DOWN
-            strategy = "PANIC_FADE"
-            direction = "DOWN"
-            score = 60 + int(panic_mag * 10)
-            reasons.append(f"PANIC FADE: Mercado subiu {panic_mag:.2f}% em minutos — exagero!")
-            reasons.append(f"Contrato BARATO: ${panic_cost:.2f} (mult {1/panic_cost:.2f}x)")
-            reasons.append(f"Backtest: 93/96 variações lucrativas")
-        elif is_panic and not panic_cost_ok:
-            # Panic detectado mas contrato CARO — não vale
-            warnings.append(f"Panic detectado mas contrato CARO (${panic_cost:.2f}) — sem lucro")
+    # PANIC FADE DESATIVADO — causou perda, estratégia não confiável
+    # Foco 100% em entradas CERTAS (alta probabilidade + contrato barato + longe da linha)
+    pass
     
-    # PRIORIDADE 2: High Probability Harvesting
-    if strategy is None and is_harvest and confidence >= 40:
-        strategy = "HIGH_PROB"
-        direction = harvest_dir
-        score = confidence
+    # ESTRATÉGIA ÚNICA: ENTRADA CERTA (alta prob + longe + barato + estável)
+    if strategy is None and is_harvest and confidence >= 50:
+        # FILTROS RIGOROSOS - só entra quando for CERTEZA:
+        # 1. Distância mínima 0.15% (longe da linha)
+        # 2. Tendência confirmada (preço se afastando)
+        # 3. Estabilidade (sem oscilação louca)
+        # 4. Contrato barato (mult >= 1.18x)
         
-        reasons.append(f"ALTA PROBABILIDADE: {probability*100:.1f}% de chance")
-        reasons.append(f"Distância segura: {dist_pct:.3f}% do target")
+        dist_ok = dist_pct >= 0.15
+        trend_ok = trend_strength >= 0  # não está indo contra
+        stable_ok = is_stable or vol_level == "LOW"
         
-        if is_stable:
-            score += 15
-            reasons.append(f"Movimento estável e calmo — previsível")
-        
-        if tr <= 120:
-            score += 10
-            reasons.append(f"Quase fechando ({int(tr//60)}:{int(tr%60):02d}) — definido")
+        if dist_ok and trend_ok and stable_ok:
+            strategy = "ENTRADA_CERTA"
+            direction = harvest_dir
+            score = confidence
+            
+            reasons.append(f"ENTRADA CERTA: {probability*100:.1f}% de chance")
+            reasons.append(f"Distância segura: {dist_pct:.3f}% do target")
+            reasons.append(f"Tendência confirmada: preço se afastando da linha")
+            
+            if is_stable:
+                score += 20
+                reasons.append(f"Movimento estável e calmo — SEGURO")
+            
+            if tr <= 120:
+                score += 10
+                reasons.append(f"Quase fechando ({int(tr//60)}:{int(tr%60):02d}) — definido")
+        else:
+            # Explica por que não entrar
+            if not dist_ok:
+                warnings.append(f"Perto demais da linha ({dist_pct:.3f}%) — PERIGOSO")
+            if not trend_ok:
+                warnings.append(f"Tendência contra — preço se aproximando da linha")
+            if not stable_ok:
+                warnings.append(f"Mercado instável — oscilando demais")
     
     # Se nenhuma estratégia se aplica
     if strategy is None:
@@ -544,11 +532,9 @@ def analyze(crypto, cfg):
         warnings.append(f"Multiplicador muito baixo ({mult:.2f}x) — lucro insuficiente")
         reasons.clear()
     
-    # Classificação final
-    if score >= 60 and mult >= MIN_MULTIPLIER:
+    # Classificação final - SÓ ENTRAR quando for CERTEZA
+    if score >= 70 and mult >= MIN_MULTIPLIER and strategy == "ENTRADA_CERTA":
         classification = "ENTRAR"
-    elif score >= 35 and mult >= MIN_MULTIPLIER:
-        classification = "POSSIVEL"
     else:
         classification = "NAO_ENTRAR"
     
