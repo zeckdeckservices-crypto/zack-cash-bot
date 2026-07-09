@@ -1,1 +1,1 @@
-worker: python loop_auto.py
+web: python loop_auto.py
