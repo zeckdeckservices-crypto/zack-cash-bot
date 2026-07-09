@@ -42,14 +42,14 @@ CRYPTOS = {
 # ═══ TIMING ═══
 # Analisar quando faltam entre 10 e 5 minutos
 # Nesse range, o contrato ainda é barato E já dá pra ver tendência
-MAX_TIME_SIGNAL = 720   # 12 minutos — aceita análise até 12 min restantes
+MAX_TIME_SIGNAL = 840   # 14 minutos — aceita análise até 14 min restantes (pega logo que abre)
 MIN_TIME_SIGNAL = 180   # 3 minutos — mínimo para o Ezequiel agir
 
-# ═══ FILTROS ═══
-MIN_DISTANCE_PCT = 0.08  # mínimo 0.08% de distância do target
-MAX_COST = 0.85          # máximo que vale pagar (acima = lucro ridículo)
-MIN_MULTIPLIER = 1.15    # multiplicador mínimo (1.15x = $100 → +$15)
-MIN_PROBABILITY = 0.55   # mínimo 55% de probabilidade implícita
+# ═══ FILTROS (RELAXADOS — mais oportunidades) ═══
+MIN_DISTANCE_PCT = 0.05  # mínimo 0.05% de distância do target
+MAX_COST = 0.91          # máximo que vale pagar (1.10x)
+MIN_MULTIPLIER = 1.10    # multiplicador mínimo (1.10x = $100 → +$10)
+MIN_PROBABILITY = 0.50   # mínimo 50% de probabilidade implícita
 
 # Kelly
 KELLY_FRACTION = 0.5
@@ -296,8 +296,9 @@ def analyze(crypto, cfg):
     dist_ok = dist_pct >= MIN_DISTANCE_PCT
     mult_ok = mult >= MIN_MULTIPLIER
     cost_ok = cost <= MAX_COST
-    trend_ok = trend_strength >= -10  # não está fortemente contra
-    stable_ok = is_stable or vol_level in ["LOW", "MEDIUM"]
+    trend_ok = trend_strength >= -30  # aceita tendência levemente contra
+    # Aceitar vol HIGH se tendência for forte a favor (preço se afastando)
+    stable_ok = is_stable or vol_level in ["LOW", "MEDIUM"] or (vol_level == "HIGH" and trend_strength >= 30)
     
     if dist_ok and mult_ok and cost_ok and trend_ok and stable_ok:
         strategy = "ENTRADA_CERTA"
@@ -371,8 +372,8 @@ def analyze(crypto, cfg):
     else:
         bet_size, expected_roi, edge = 0, 0, 0
     
-    # Classificação final
-    if strategy == "ENTRADA_CERTA" and score >= 60:
+    # Classificação final — MENOS CONSERVADOR
+    if strategy == "ENTRADA_CERTA" and score >= 50:
         classification = "ENTRAR"
     else:
         classification = "NAO_ENTRAR"
