@@ -1,0 +1,3 @@
+__pycache__/
+*.pyc
+trade_log.json
