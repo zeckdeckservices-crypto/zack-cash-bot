@@ -8,12 +8,33 @@ Se detectar PANIC FADE, envia imediatamente.
 ═══════════════════════════════════════════════
 """
 
-import time, requests, pandas as pd, subprocess, sys, os
+import time, requests, subprocess, sys, os, threading
 from datetime import datetime, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# ═══════════════════════════════════════════════
+# HEALTH CHECK SERVER (mantém Railway ativo)
+# ═══════════════════════════════════════════════
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ZACK CASH v4.0 - RUNNING")
+    def log_message(self, format, *args):
+        pass  # Silenciar logs HTTP
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+# ═══════════════════════════════════════════════
+# CONFIGURAÇÃO
+# ═══════════════════════════════════════════════
 KALSHI_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8964872216:AAG8dRobgqX3oB9iAsZ84d6HuWD_4SUIedw")
-CHAT_ID = int(os.environ.get("CHAT_ID", "8367252203"))
+CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "8367252203"))
 
 # Configuração de timing
 SIGNAL_WINDOW = 300  # Enviar sinal quando faltar 5 minutos (300s)
@@ -30,6 +51,7 @@ def send_telegram(text):
 def get_time_remaining():
     """Pega o tempo restante do próximo mercado a fechar."""
     try:
+        import pandas as pd
         r = requests.get(f"{KALSHI_BASE_URL}/events",
             params={"series_ticker": "KXBTC15M", "status": "open",
                     "with_nested_markets": True, "limit": 1}, timeout=10)
@@ -58,13 +80,14 @@ def run_bot():
         )
         print(result.stdout)
         if result.stderr:
-            print(f"STDERR: {result.stderr[:200]}")
+            print(f"STDERR: {result.stderr[:500]}")
         return True
     except Exception as e:
         print(f"ERRO ao rodar bot: {e}")
         return False
 
-def main():
+def bot_loop():
+    """Loop principal do bot."""
     print("=" * 60)
     print("  ZACK CASH v4.0 — LOOP AUTOMÁTICO 24H (RAILWAY)")
     print("  Monitorando 24h | Sinal com 5 min restantes")
@@ -80,7 +103,7 @@ def main():
         "⏱ Sinal enviado com 5 min restantes\n"
         "🔄 Estratégias: Panic Fade + Alta Prob + Kelly\n\n"
         "🟢 = ENTRAR | 🔴 = NÃO ENTRAR\n\n"
-        "💰 Custo máximo: $0.80 (mult mínimo 1.25x)"
+        "💰 Custo máximo: $0.85 (mult mínimo 1.18x)"
     )
     
     signal_sent_for_cycle = None
@@ -120,10 +143,10 @@ def main():
             # Se falta muito tempo, aguardar
             if tr > SIGNAL_WINDOW:
                 wait = tr - SIGNAL_WINDOW
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Faltam {mins}:{secs:02d}. Sinal em {int(wait//60)}:{int(wait%60):02d}.", end="\r")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Faltam {mins}:{secs:02d}. Sinal em {int(wait//60)}:{int(wait%60):02d}.")
                 time.sleep(min(wait, CHECK_INTERVAL))
             else:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Ciclo quase fechando ({mins}:{secs:02d}). Aguardando próximo...", end="\r")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Ciclo quase fechando ({mins}:{secs:02d}). Aguardando próximo...")
                 time.sleep(CHECK_INTERVAL)
                 
         except KeyboardInterrupt:
@@ -133,6 +156,15 @@ def main():
         except Exception as e:
             print(f"\n[ERRO] {e}. Tentando novamente em 30s...")
             time.sleep(30)
+
+def main():
+    # Iniciar health check server em thread separada
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    print(f"[HEALTH] Servidor HTTP rodando na porta {os.environ.get('PORT', 8080)}")
+    
+    # Iniciar loop do bot
+    bot_loop()
 
 if __name__ == "__main__":
     main()
