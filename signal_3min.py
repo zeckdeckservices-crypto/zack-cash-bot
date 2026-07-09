@@ -20,6 +20,15 @@ ESTRATÉGIA ÚNICA: ENTRADA CERTA
 import os, requests, numpy as np, pandas as pd, re, json, time
 from datetime import datetime, timezone
 
+# Auto-aprendizado
+try:
+    from tracker import (register_signal, check_pending_results, 
+                         calculate_adaptive_score, get_min_score, load_weights)
+    TRACKER_ENABLED = True
+except ImportError:
+    TRACKER_ENABLED = False
+    print("[AVISO] Tracker não disponível - rodando sem aprendizado")
+
 # ═══════════════════════════════════════════════════════════
 # CONFIGURAÇÃO
 # ═══════════════════════════════════════════════════════════
@@ -303,48 +312,31 @@ def analyze(crypto, cfg):
     if dist_ok and mult_ok and cost_ok and trend_ok and stable_ok:
         strategy = "ENTRADA_CERTA"
         
-        # Calcular score
-        # Distância
-        if dist_pct >= 0.30:
-            score += 40
-        elif dist_pct >= 0.20:
-            score += 35
-        elif dist_pct >= 0.15:
-            score += 30
-        elif dist_pct >= 0.10:
-            score += 25
+        # Calcular score (ADAPTATIVO se tracker disponível)
+        if TRACKER_ENABLED:
+            score = calculate_adaptive_score(dist_pct, mult, trend_strength, vol_level, tr)
         else:
-            score += 15
-        
-        # Multiplicador (quanto mais barato, melhor)
-        if mult >= 2.0:
-            score += 30
-        elif mult >= 1.5:
-            score += 25
-        elif mult >= 1.3:
-            score += 20
-        elif mult >= 1.15:
-            score += 15
-        
-        # Tendência
-        if trend_strength >= 50:
-            score += 20
-        elif trend_strength >= 20:
-            score += 15
-        elif trend_strength >= 0:
-            score += 10
-        
-        # Estabilidade
-        if vol_level == "LOW":
-            score += 15
-        elif vol_level == "MEDIUM":
-            score += 10
-        
-        # Tempo (quanto menos tempo, mais definido)
-        if tr <= 300:
-            score += 10
-        elif tr <= 480:
-            score += 5
+            # Score fixo (fallback)
+            if dist_pct >= 0.30: score += 40
+            elif dist_pct >= 0.20: score += 35
+            elif dist_pct >= 0.15: score += 30
+            elif dist_pct >= 0.10: score += 25
+            else: score += 15
+            
+            if mult >= 2.0: score += 30
+            elif mult >= 1.5: score += 25
+            elif mult >= 1.3: score += 20
+            elif mult >= 1.10: score += 15
+            
+            if trend_strength >= 50: score += 20
+            elif trend_strength >= 20: score += 15
+            elif trend_strength >= 0: score += 10
+            
+            if vol_level == "LOW": score += 15
+            elif vol_level == "MEDIUM": score += 10
+            
+            if tr <= 300: score += 10
+            elif tr <= 480: score += 5
         
         reasons.append(f"Distância segura: {dist_pct:.3f}% do target")
         reasons.append(f"Contrato barato: ${cost:.2f} (mult {mult:.2f}x)")
@@ -372,13 +364,14 @@ def analyze(crypto, cfg):
     else:
         bet_size, expected_roi, edge = 0, 0, 0
     
-    # Classificação final — MENOS CONSERVADOR
-    if strategy == "ENTRADA_CERTA" and score >= 50:
+    # Classificação final — ADAPTATIVO
+    min_score = get_min_score() if TRACKER_ENABLED else 50
+    if strategy == "ENTRADA_CERTA" and score >= min_score:
         classification = "ENTRAR"
     else:
         classification = "NAO_ENTRAR"
     
-    return {
+    result = {
         "crypto": crypto,
         "skip": False,
         "strategy": strategy,
@@ -402,7 +395,10 @@ def analyze(crypto, cfg):
         "time_remaining": tr,
         "reasons": reasons,
         "warnings": warnings,
+        "close_time": market.get("close_time", ""),
+        "kucoin_symbol": cfg["kucoin"],
     }
+    return result
 
 
 # ═══════════════════════════════════════════════════════════
@@ -495,11 +491,25 @@ def format_message(results, skipped):
 
 def main():
     print("=" * 60)
-    print("  ZACK CASH v4.2 — ENTRADA CERTA (timing corrigido)")
-    print("  Analisa com 10 min restantes | Mult >= 1.15x")
+    print("  ZACK CASH v4.3 — AUTO-APRENDIZADO")
+    print("  Analisa + Registra + Aprende com resultados")
     print("=" * 60)
     print()
     
+    # 1. Verificar resultados pendentes (aprender com ciclos anteriores)
+    if TRACKER_ENABLED:
+        try:
+            resolved = check_pending_results()
+            if resolved:
+                print(f"  [LEARN] {len(resolved)} resultados verificados")
+                for r in resolved:
+                    emoji = '✅' if r.get('won') else '❌'
+                    print(f"    {emoji} {r['crypto']} {r['direction']} — {r.get('result', '?')}")
+                print()
+        except Exception as e:
+            print(f"  [LEARN] Erro ao verificar: {e}")
+    
+    # 2. Analisar mercados atuais
     results = []
     skipped = []
     
@@ -517,11 +527,30 @@ def main():
             results.append(r)
             print(f"  {crypto}: {r['direction']} | {r['classification']} | score={r['score']} | dist={r['dist_pct']:.3f}% | ${r['cost']:.2f} ({r['mult']:.2f}x)")
     
-    # Formatar e enviar
+    # 3. Formatar e enviar
     msg, is_entry = format_message(results, skipped)
     ok = send_telegram(msg)
     
+    # 4. Registrar sinais ENTRAR no tracker (para verificar depois)
+    if TRACKER_ENABLED:
+        entries = [r for r in results if r.get("classification") == "ENTRAR"]
+        for entry in entries:
+            try:
+                register_signal(entry)
+            except Exception as e:
+                print(f"  [TRACKER] Erro ao registrar: {e}")
+    
     print(f"\n[{'OK' if ok else 'ERRO TELEGRAM'}] Mensagem enviada: {'ENTRAR' if is_entry else 'NÃO ENTRAR/AGUARDANDO'}")
+    
+    # Mostrar pesos atuais
+    if TRACKER_ENABLED:
+        try:
+            w = load_weights()
+            if w.get('total_signals', 0) > 0:
+                wr = w['total_wins'] / w['total_signals'] * 100 if w['total_signals'] > 0 else 0
+                print(f"  [STATS] Win rate: {wr:.0f}% ({w['total_wins']}/{w['total_signals']}) | Score min: {w['min_score_threshold']}")
+        except:
+            pass
 
 
 if __name__ == "__main__":

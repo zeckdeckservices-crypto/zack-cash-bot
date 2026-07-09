@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 trade_log.json
+tracker_data.json
+learned_weights.json

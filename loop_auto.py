@@ -11,6 +11,13 @@ import time, requests, sys, os, threading, traceback
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# Tracker
+try:
+    from tracker import check_pending_results, generate_report
+    TRACKER_ENABLED = True
+except ImportError:
+    TRACKER_ENABLED = False
+
 # ═══════════════════════════════════════════════
 # HEALTH CHECK SERVER (mantém Railway ativo)
 # ═══════════════════════════════════════════════
@@ -48,28 +55,41 @@ def send_telegram(text):
 def bot_loop():
     """Loop principal — roda signal_3min.py a cada ciclo de 15 min."""
     print("=" * 60)
-    print("  ZACK CASH v4.2 — LOOP AUTOMÁTICO 24H")
-    print("  Analisa com 10 min restantes (contrato barato)")
-    print("  ENTRADA CERTA only | Mult >= 1.15x")
+    print("  ZACK CASH v4.3 — AUTO-APRENDIZADO 24H")
+    print("  Analisa + Aprende + Se adapta")
+    print("  Mult >= 1.10x | Score adaptativo")
     print("=" * 60)
     print()
     
     # Avisar no Telegram que está ativo
     send_telegram(
-        "🤖 <b>ZACK CASH v4.2 — ATIVO NA NUVEM</b>\n\n"
+        "🤖 <b>ZACK CASH v4.3 — ATIVO NA NUVEM</b>\n\n"
         "✅ Bot rodando 24h no Railway!\n"
         "📡 Monitorando todos os ciclos de 15 min\n"
-        "⏱ Análise com 10 min restantes\n"
-        "🎯 Estratégia: ENTRADA CERTA (alta prob + barato + longe)\n\n"
-        "🟢 = ENTRAR | 🔴 = NÃO ENTRAR"
+        "🧠 AUTO-APRENDIZADO ativo\n"
+        "🎯 Mult mínimo: 1.10x | Score adaptativo\n\n"
+        "🟢 = ENTRAR | 🔴 = NÃO ENTRAR\n"
+        "📊 Relatório de performance a cada 4h"
     )
     
     cycle_count = 0
+    last_report_hour = -1
     
     while True:
         try:
-            # Rodar o bot diretamente (importar e executar)
-            # Isso é mais confiável que subprocess
+            # Enviar relatório a cada 4 horas
+            current_hour = datetime.now().hour
+            if TRACKER_ENABLED and current_hour % 4 == 0 and current_hour != last_report_hour:
+                try:
+                    report = generate_report()
+                    if report:
+                        send_telegram(report)
+                        print(f"[REPORT] Relatório enviado ({current_hour}h)")
+                    last_report_hour = current_hour
+                except Exception as e:
+                    print(f"[REPORT] Erro: {e}")
+            
+            # Rodar o bot
             print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Executando análise...")
             
             result = run_signal()
